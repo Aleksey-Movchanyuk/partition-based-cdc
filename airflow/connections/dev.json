@@ -1,0 +1,12 @@
+{
+  "oracle_neobank": {
+    "conn_type": "oracle",
+    "description": "",
+    "login": "neobank",
+    "password": "neobank",
+    "host": "localhost",
+    "port": 1521,
+    "schema": "",
+    "extra": "{\"service_name\": \"orcl\"}"
+  }
+}
