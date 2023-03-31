@@ -1,4 +1,4 @@
-# Oracle to Snowflake Data Synchronization POC
+# Oracle -> Snowflake Data Synchronization POC
 
 This proof of concept (POC) demonstrates how to migrate changed partitions from an Oracle database to a Snowflake database using Apache Airflow, Parquet files, and Python.
 
