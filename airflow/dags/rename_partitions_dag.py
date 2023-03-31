@@ -13,7 +13,7 @@ default_args = {
 }
 
 dag = DAG(
-    'rename_partitions_dag',
+    'rename_partitions',
     default_args=default_args,
     description='A DAG to rename partitions in Oracle database',
     schedule_interval='0 0 * * *', # run at midnight every day
