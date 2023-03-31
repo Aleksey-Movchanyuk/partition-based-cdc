@@ -1,27 +1,53 @@
-# Partition-Based CDC POC
+# Oracle to Snowflake Data Synchronization POC
 
-This is a proof-of-concept project to explore the feasibility of building a Change Data Capture (CDC) solution at the partition level for an Oracle database. The goal of the project is to determine whether it is possible to efficiently and reliably capture changes to individual partitions of large tables, and propagate those changes to a Hadoop file system.
+This proof of concept (POC) demonstrates how to migrate changed partitions from an Oracle database to a Snowflake database using Apache Airflow, Parquet files, and Python.
 
-## Project Description
+## Overview
 
-The project uses Apache Airflow to trigger a daily job that connects to the Oracle database and queries the ```ALL_TAB_PARTITIONS``` view to retrieve a list of partitions that have been modified since the last run. It then uses an Oracle Data Pump tool to extract the modified partitions from the database and export them to a file. Finally, the file is copied to the Hadoop file system and the modified partitions are replaced in place.
+The POC consists of an Apache Airflow DAG that performs the following steps:
 
-The project includes sample code to demonstrate the process, as well as configuration files for Apache Airflow and the Oracle Data Pump tool. The goal is to test the scalability and efficiency of the approach, as well as identify any potential challenges or limitations.
+1. Gather statistics for an Oracle table.
+2. Find the partitions changed since the last DAG run.
+3. Export changed partitions into Parquet files.
+4. Upload Parquet files to Snowflake.
 
-## Getting Started
-To get started with the project, you will need:
+## Requirements
 
-* An Oracle database with sample data
-* A Hadoop file system
-* Apache Airflow installed and configured
-* The Oracle Data Pump tool installed and configured
-* Once you have these components set up, you can clone the repository and run the sample code to test the process.
+- Python 3.6 or higher
+- Apache Airflow
+- Oracle database with a partitioned table
+- Snowflake account with a target database and schema
+- Python libraries: `cx_Oracle`, `pandas`, `pyarrow`, and `snowflake-connector-python`
 
-## Contributing
-This project is intended as a proof-of-concept and is not actively maintained. However, contributions are welcome and will be considered on a case-by-case basis.
+You can install the required Python libraries using the following command:
 
-## License
-This project is licensed under the MIT License - see the LICENSE file for details.
+```bash
+pip install cx_Oracle pandas pyarrow snowflake-connector-python
+```
 
-## Acknowledgments
-This project was inspired by the need for a more efficient and scalable approach to capturing changes to large Oracle databases. Thanks to the Apache Airflow and Hadoop communities for their contributions to the project.
+### Setup
+
+1. Install Apache Airflow following the [official documentation](https://airflow.apache.org/docs/apache-airflow/stable/start.html).
+2. Place the oracle_to_snowflake_dag.py file in your Airflow DAGs folder.
+3. Replace the placeholders in oracle_to_snowflake_dag.py with your Oracle and Snowflake connection details, schema names, and table names.
+4. Start the Airflow web server and scheduler.
+5. Access the Airflow web interface and enable the oracle_to_snowflake DAG.
+
+
+### Usage
+
+Once the DAG is enabled in Airflow, it will run according to the specified schedule (daily, by default). The DAG will gather statistics for the specified Oracle table, find the changed partitions since the last run, export the changed partitions to Parquet files, and then upload the Parquet files to Snowflake.
+
+You can also trigger the DAG manually from the Airflow web interface or using the Airflow CLI:
+
+```
+airflow dags trigger oracle_to_snowflake
+```
+
+### Notes
+
+* Ensure that you have the necessary privileges to access the Oracle and Snowflake databases, gather statistics, and perform data migration operations.
+* This POC assumes that the target Snowflake table has the same structure as the source Oracle table. You may need to modify the code if your target table has a different structure or additional columns for metadata.
+* You can customize the DAG schedule, retry settings, and other parameters according to your needs.
+
+This `README.md` provides an overview of the POC, requirements, setup instructions, and usage information. You may customize the content as needed for your specific use case.

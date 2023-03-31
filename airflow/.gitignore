@@ -220,3 +220,5 @@ pip-wheel-metadata
 .pypirc
 
 airflow-webserver.pid
+
+output
