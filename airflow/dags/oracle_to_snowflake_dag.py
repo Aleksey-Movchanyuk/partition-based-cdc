@@ -13,6 +13,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 #import snowflake.connector
 
+from helpers import export_partition_to_parquet, export_non_partitioned_table_to_parquet, get_high_value
+
 
 # Global variables
 tables_non_partitioned = ['CLIENT', 'ACCOUNT', 'CARD', 'COUNTRY', 'CURRENCY']
@@ -22,25 +24,6 @@ tables_partitioned_by_month = []
 postgres_conn_id = 'postgres_metadata'
 oracle_conn_id = "oracle_neobank"
 schema_name = 'NEOBANK' 
-
-
-def gather_statistics():
-    hook = OracleHook(oracle_conn_id=oracle_conn_id)
-    conn = hook.get_conn()
-
-    # Combine all table lists
-    all_tables = tables_non_partitioned + tables_partitioned_by_day + tables_partitioned_by_month
-
-    # Iterate through the list of tables to gather statistics
-    gather_stats_query = """
-    BEGIN
-      DBMS_STATS.GATHER_TABLE_STATS(ownname => :schema_name, tabname => :table_name);
-    END;
-    """
-
-    for table_name in all_tables:
-        with conn.cursor() as cursor:
-            cursor.execute(gather_stats_query, (schema_name, table_name))
 
 
 def flush_database_monitoring_info():
@@ -58,177 +41,89 @@ def flush_database_monitoring_info():
         cursor.execute(flush_database_monitoring_info_query)
 
 
-def create_snapshot_all_tab_modifications():
+def get_tab_modifications(**kwargs):
     # Connect to Oracle and fetch data from USER_TAB_MODIFICATIONS
     oracle_hook = OracleHook(oracle_conn_id)
     oracle_conn = oracle_hook.get_conn()
 
     oracle_query = """
-    SELECT TABLE_NAME, PARTITION_NAME, SUBPARTITION_NAME, INSERTS, UPDATES, DELETES, TIMESTAMP, TRUNCATED, DROP_SEGMENTS
+    SELECT TABLE_NAME, PARTITION_NAME, SUBPARTITION_NAME, INSERTS, UPDATES, DELETES, TIMESTAMP AS TIMESTAMP_VAL, TRUNCATED, DROP_SEGMENTS
     FROM USER_TAB_MODIFICATIONS
     """
+
 
     oracle_data = []
     with oracle_conn.cursor() as oracle_cursor:
         oracle_cursor.execute(oracle_query)
-        oracle_data = oracle_cursor.fetchall()
+        for row in oracle_cursor.fetchall():
+            row = list(row)
+            row[6] = row[6].strftime("%Y-%m-%d %H:%M:%S")  # Convert datetime to string
+            oracle_data.append(tuple(row))
 
-    # Connect to PostgreSQL and insert data into the snapshot_all_tab_modifications table
+
+    # Pass the comparison results to the next task using XCom
+    kwargs["task_instance"].xcom_push("tab_modifications", oracle_data)
+
+
+def save_tab_modifications_snapshot(**kwargs):
+    tab_modifications = kwargs["task_instance"].xcom_pull(task_ids="get_tab_modifications", key="tab_modifications")
+
+    # Connect to PostgreSQL and insert data into the snapshot_tab_modifications table
     postgres_hook = PostgresHook(postgres_conn_id)
     postgres_conn = postgres_hook.get_conn()
 
     postgres_insert_query = """
-    INSERT INTO snapshot_all_tab_modifications (
+    INSERT INTO snapshot_tab_modifications (
         snapshot_dt, table_owner, table_name, partition_name, subpartition_name, inserts, updates, deletes, "timestamp", truncated, drop_segments)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
     snapshot_dt = datetime.now()
     with postgres_conn.cursor() as postgres_cursor:
-        for row in oracle_data:
-            postgres_cursor.execute(postgres_insert_query, (snapshot_dt, schema_name,) + row)
+        for row in tab_modifications:
+            postgres_cursor.execute(postgres_insert_query, (snapshot_dt, schema_name,) + tuple(row))
         postgres_conn.commit()
 
 
-def get_snapshot(**kwargs):
-    postgres_hook = PostgresHook(postgres_conn_id)
-    postgres_conn = postgres_hook.get_conn()
-
-    compare_snapshots_query = """
-        WITH snapshot_all_tab_modifications_ordered AS (
-            SELECT 
-                row_number() OVER (PARTITION BY table_owner, table_name, partition_name, subpartition_name ORDER BY snapshot_dt DESC) rn,
-                *
-            FROM snapshot_all_tab_modifications
-        )
-        SELECT 
-            cur.table_owner,
-            cur.table_name,
-            cur.partition_name,
-            cur.subpartition_name,
-            cur.inserts,
-            cur.updates,
-            cur.deletes
-        FROM snapshot_all_tab_modifications_ordered cur
-        WHERE cur.rn = 1;
-    """
-
-    with postgres_conn.cursor() as cursor:
-        cursor.execute(compare_snapshots_query)
-        snapshot_results = cursor.fetchall()
-
-    # Pass the comparison results to the next task using XCom
-    kwargs["task_instance"].xcom_push("snapshot_results", snapshot_results)
-
-
-def get_partition_label(table_name, high_value):
-    partition_label = None
-
-    if table_name in tables_partitioned_by_day:
-        high_value_date = high_value - timedelta(days=1)
-        partition_label = f"{table_name}_{high_value_date.strftime('%Y_%m_%d')}"
-    elif table_name in tables_partitioned_by_month:
-        high_value_date = high_value - timedelta(days=1)
-        partition_label = f"{table_name}_{high_value_date.strftime('%Y_%m')}"
-
-    return partition_label
-
-
-def get_high_value(table_name, partition_name, subpartition_name):
-    oracle_hook = OracleHook(oracle_conn_id)
-    conn = oracle_hook.get_conn()
-    
-    if subpartition_name is not None:
-        query = f"SELECT high_value FROM user_tab_subpartitions WHERE table_name = '{table_name}' AND subpartition_name = '{subpartition_name}'"
-    else:
-        query = f"SELECT high_value FROM user_tab_partitions WHERE table_name = '{table_name}' AND partition_name = '{partition_name}'"
-
-    with conn.cursor() as cursor:
-        cursor.execute(query)
-        high_value = cursor.fetchone()[0]
-
-    # Extract the date from the high_value string
-    date_regex = r'\d{4}-\d{2}-\d{2}'
-    date_string = re.search(date_regex, high_value).group(0)
-
-    return date_string
-
-
-def export_non_partitioned_table_to_parquet(table_name):
-    oracle_hook = OracleHook(oracle_conn_id)
-    conn = oracle_hook.get_conn()
-
-    query = f"SELECT * FROM {table_name}"
-    columns_query = f"SELECT column_name FROM all_tab_columns WHERE table_name = '{table_name}' ORDER BY column_id"
-
-    with conn.cursor() as cursor:
-        cursor.execute(columns_query)
-        columns = [row[0] for row in cursor.fetchall()]
-
-        cursor.execute(query)
-        data = cursor.fetchall()
-
-    df = pd.DataFrame(data, columns=columns)
-    table = pa.Table.from_pandas(df)
-    pq.write_table(table, f"output/parquet/{table_name}.parquet")
-
-
-def export_partition_to_parquet(table_name, partition_name, partition_label):
-    oracle_hook = OracleHook(oracle_conn_id)
-    conn = oracle_hook.get_conn()
-
-    query = f"SELECT * FROM {table_name} PARTITION ({partition_name})"
-    columns_query = f"SELECT column_name FROM all_tab_columns WHERE table_name = '{table_name}' ORDER BY column_id"
-
-    with conn.cursor() as cursor:
-        cursor.execute(columns_query)
-        columns = [row[0] for row in cursor.fetchall()]
-
-        cursor.execute(query)
-        data = cursor.fetchall()
-
-    df = pd.DataFrame(data, columns=columns)
-    table = pa.Table.from_pandas(df)
-    pq.write_table(table, f"output/parquet/{table_name}_{partition_label}.parquet")
-
-
 def export_changed_data(**kwargs):
-    comparison_results = kwargs["task_instance"].xcom_pull(task_ids="get_snapshot", key="snapshot_results")
+    tab_modifications = kwargs["task_instance"].xcom_pull(task_ids="get_tab_modifications", key="tab_modifications")
 
-    if comparison_results is None:
-        logging.error("No comparison results found.")
+    if tab_modifications is None:
+        logging.error("No changed tables or partitions results found.")
         return
     
     changed_tables = set()
     changed_partitions = set()
 
-    for row in comparison_results:
-        _, table_name, partition_name, subpartition_name, inserts_diff, updates_diff, deletes_diff = row
+    for row in tab_modifications:
+        table_name, partition_name, subpartition_name, inserts, updates, deletes, timestamp_val, truncated, drop_segments = tuple(row)
 
-        if any([inserts_diff, updates_diff, deletes_diff]):
+        if any([inserts, updates, deletes, truncated=='YES', drop_segments]):
             if partition_name is None:
                 changed_tables.add(table_name)
             else:
-                changed_partitions.add((table_name, partition_name, subpartition_name))
+                changed_partitions.add((table_name, partition_name))
 
     # Export changed tables from tables_non_partitioned
     for table_name in changed_tables:
         if table_name in tables_non_partitioned:
-            export_non_partitioned_table_to_parquet(table_name)
+            export_non_partitioned_table_to_parquet(oracle_conn_id, table_name)
 
     # Export changed partitions
-    for table_name, partition_name, subpartition_name in changed_partitions:
-        high_value = get_high_value(table_name, partition_name, subpartition_name)
-        high_value_date = datetime.strptime(high_value, '%Y-%m-%d')
-        partition_label = None
+    for table_name, partition_name in changed_partitions:
+        # Skip aggregated row
+        if partition_name is not None:
+            high_value = get_high_value(oracle_conn_id, table_name, partition_name)
+            high_value_date = datetime.strptime(high_value, '%Y-%m-%d')
+            partition_label = None
 
-        if table_name in tables_partitioned_by_day:
-            partition_label = high_value_date.strftime('%Y_%m_%d')
-        elif table_name in tables_partitioned_by_month:
-            partition_label = high_value_date.strftime('%Y_%m')
+            if table_name in tables_partitioned_by_day:
+                partition_label = high_value_date.strftime('%Y_%m_%d')
+            elif table_name in tables_partitioned_by_month:
+                partition_label = high_value_date.strftime('%Y_%m')
 
-        if partition_label:
-            export_partition_to_parquet(table_name, partition_name, partition_label)
+            if partition_label:
+                export_partition_to_parquet(oracle_conn_id, table_name, partition_name, partition_label)
 
 
 def upload_parquet_to_snowflake(**kwargs):
@@ -299,16 +194,16 @@ flush_database_monitoring_info_task = PythonOperator(
     dag=dag,
 )
 
-create_snapshot_all_tab_modifications_task = PythonOperator(
-    task_id="create_snapshot_all_tab_modifications",
-    python_callable=create_snapshot_all_tab_modifications,
+get_tab_modifications_task = PythonOperator(
+    task_id="get_tab_modifications",
+    python_callable=get_tab_modifications,
     provide_context=True,
     dag=dag,
 )
 
-get_snapshot_task = PythonOperator(
-    task_id="get_snapshot",
-    python_callable=get_snapshot,
+save_tab_modifications_snapshot_task = PythonOperator(
+    task_id="save_tab_modifications_snapshot",
+    python_callable=save_tab_modifications_snapshot,
     provide_context=True,
     dag=dag,
 )
@@ -328,4 +223,7 @@ export_changed_data_task = PythonOperator(
 #    dag=dag,
 #)
 
-flush_database_monitoring_info_task >> create_snapshot_all_tab_modifications_task >> get_snapshot_task >> export_changed_data_task ## >> upload_to_snowflake_task
+flush_database_monitoring_info_task >> get_tab_modifications_task
+
+get_tab_modifications_task >> save_tab_modifications_snapshot_task
+get_tab_modifications_task >> export_changed_data_task ## >> upload_to_snowflake_task
