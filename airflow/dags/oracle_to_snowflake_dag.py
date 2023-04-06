@@ -4,7 +4,8 @@ import logging
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
+from airflow.decorators import task
+from airflow.operators.empty import EmptyOperator
 from airflow.providers.oracle.hooks.oracle import OracleHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
@@ -15,7 +16,6 @@ import pyarrow.parquet as pq
 
 from helpers import export_partition_to_parquet, export_non_partitioned_table_to_parquet, get_high_value
 
-
 # Global variables
 tables_non_partitioned = ['CLIENT', 'ACCOUNT', 'CARD', 'COUNTRY', 'CURRENCY']
 tables_partitioned_by_day = ['TRANSACTION']
@@ -23,9 +23,9 @@ tables_partitioned_by_month = []
 
 postgres_conn_id = 'postgres_metadata'
 oracle_conn_id = "oracle_neobank"
-schema_name = 'NEOBANK' 
+schema_name = 'NEOBANK'
 
-
+@task
 def flush_database_monitoring_info():
     hook = OracleHook(oracle_conn_id=oracle_conn_id)
     conn = hook.get_conn()
@@ -40,8 +40,8 @@ def flush_database_monitoring_info():
     with conn.cursor() as cursor:
         cursor.execute(flush_database_monitoring_info_query)
 
-
-def get_tab_modifications(**kwargs):
+@task
+def get_tab_modifications():
     # Connect to Oracle and fetch data from USER_TAB_MODIFICATIONS
     oracle_hook = OracleHook(oracle_conn_id)
     oracle_conn = oracle_hook.get_conn()
@@ -51,7 +51,6 @@ def get_tab_modifications(**kwargs):
     FROM USER_TAB_MODIFICATIONS
     """
 
-
     oracle_data = []
     with oracle_conn.cursor() as oracle_cursor:
         oracle_cursor.execute(oracle_query)
@@ -60,14 +59,10 @@ def get_tab_modifications(**kwargs):
             row[6] = row[6].strftime("%Y-%m-%d %H:%M:%S")  # Convert datetime to string
             oracle_data.append(tuple(row))
 
+    return oracle_data
 
-    # Pass the comparison results to the next task using XCom
-    kwargs["task_instance"].xcom_push("tab_modifications", oracle_data)
-
-
-def save_tab_modifications_snapshot(**kwargs):
-    tab_modifications = kwargs["task_instance"].xcom_pull(task_ids="get_tab_modifications", key="tab_modifications")
-
+@task
+def save_tab_modifications_snapshot(tab_modifications):
     # Connect to PostgreSQL and insert data into the snapshot_tab_modifications table
     postgres_hook = PostgresHook(postgres_conn_id)
     postgres_conn = postgres_hook.get_conn()
@@ -84,14 +79,12 @@ def save_tab_modifications_snapshot(**kwargs):
             postgres_cursor.execute(postgres_insert_query, (snapshot_dt, schema_name,) + tuple(row))
         postgres_conn.commit()
 
-
-def export_changed_data(**kwargs):
-    tab_modifications = kwargs["task_instance"].xcom_pull(task_ids="get_tab_modifications", key="tab_modifications")
-
+@task
+def export_changed_data(tab_modifications):
     if tab_modifications is None:
         logging.error("No changed tables or partitions results found.")
         return
-    
+
     changed_tables = set()
     changed_partitions = set()
 
@@ -125,48 +118,6 @@ def export_changed_data(**kwargs):
             if partition_label:
                 export_partition_to_parquet(oracle_conn_id, table_name, partition_name, partition_label)
 
-
-def upload_parquet_to_snowflake(**kwargs):
-    changed_partitions = kwargs["task_instance"].xcom_pull("changed_partitions")
-
-    # Replace with your Snowflake connection details
-    conn = snowflake.connector.connect(
-        user="your_user",
-        password="your_password",
-        account="your_account",
-        warehouse="your_warehouse",
-        database="your_database",
-        schema="your_schema",
-    )
-
-    for partition_name, last_analyzed in changed_partitions:
-        parquet_file_path = os.path.join("path/to/output/parquet", f"{partition_name}.parquet")
-
-        with open(parquet_file_path, "rb") as file:
-            # Replace TABLE_NAME with your target Snowflake table name
-            query = f"""
-            PUT file://{parquet_file_path}
-            @%TABLE_NAME
-            AUTO_COMPRESS=TRUE
-            """
-
-            with conn.cursor() as cursor:
-                cursor.execute(query)
-
-            # Replace TABLE_NAME with your target Snowflake table name
-            query = f"""
-            COPY INTO TABLE_NAME
-            FROM @%TABLE_NAME/{os.path.basename(parquet_file_path)}
-            FILE_FORMAT = (TYPE = PARQUET)
-            ON_ERROR = CONTINUE
-            """
-
-            with conn.cursor() as cursor:
-                cursor.execute(query)
-
-    conn.close()
-
-
 # Define the DAG
 default_args = {
     'owner': 'airflow',
@@ -186,44 +137,16 @@ dag = DAG(
     catchup=False,
 )
 
-# Define the tasks
-flush_database_monitoring_info_task = PythonOperator(
-    task_id="flush_database_monitoring_info",
-    python_callable=flush_database_monitoring_info,
-    provide_context=True,
-    dag=dag,
-)
+# Define the task dependencies
+with dag:
+    flush_database_monitoring_info_task = flush_database_monitoring_info()
+    tab_modifications = get_tab_modifications()
+    save_tab_modifications_snapshot_task = save_tab_modifications_snapshot(tab_modifications)
+    export_changed_data_task = export_changed_data(tab_modifications)
 
-get_tab_modifications_task = PythonOperator(
-    task_id="get_tab_modifications",
-    python_callable=get_tab_modifications,
-    provide_context=True,
-    dag=dag,
-)
+    final = EmptyOperator(task_id=f"final")
 
-save_tab_modifications_snapshot_task = PythonOperator(
-    task_id="save_tab_modifications_snapshot",
-    python_callable=save_tab_modifications_snapshot,
-    provide_context=True,
-    dag=dag,
-)
+    flush_database_monitoring_info_task >> tab_modifications
+    tab_modifications >> save_tab_modifications_snapshot_task
+    tab_modifications >> export_changed_data_task >> final
 
-export_changed_data_task = PythonOperator(
-    task_id="export_changed_data",
-    python_callable=export_changed_data,
-    provide_context=True,
-    dag=dag,
-)
-
-
-#upload_to_snowflake_task = PythonOperator(
-#    task_id="upload_parquet_to_snowflake",
-#    python_callable=upload_parquet_to_snowflake,
-#    provide_context=True,
-#    dag=dag,
-#)
-
-flush_database_monitoring_info_task >> get_tab_modifications_task
-
-get_tab_modifications_task >> save_tab_modifications_snapshot_task
-get_tab_modifications_task >> export_changed_data_task ## >> upload_to_snowflake_task
